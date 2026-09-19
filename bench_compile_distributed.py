@@ -38,7 +38,15 @@ import torch.distributed as dist
 import torch.nn as nn
 from torch.distributed.fsdp import fully_shard
 
-from bench_utils import BENCH_NCCL_TIMEOUT, bench, collect_metadata, reset_nccl_tuning, verify_close, write_json
+from bench_utils import (
+    BENCH_NCCL_TIMEOUT, bench, collect_metadata, fsdp_mp_policy,
+    reset_nccl_tuning, verify_close, write_json,
+)
+
+# Dtypes run_all.sh sweeps (read from this line); the first is the default.
+# Inductor codegen differs per dtype; FSDP2 params are fp32 master weights
+# under mp_policy.
+DTYPES = ("bf16", "fp16", "fp32")
 
 
 def verify_compiled_output(eager_model, compiled_model, inp):
@@ -104,12 +112,11 @@ class TPModel(nn.Module):
 
 
 def build_fsdp_model(hidden, intermediate, num_layers, device, dtype):
-    model = FSDPModel(hidden, intermediate, num_layers).to(
-        device=device, dtype=dtype
-    )
+    model = FSDPModel(hidden, intermediate, num_layers).to(device=device)
+    mp_policy = fsdp_mp_policy(dtype)
     for layer in model.layers:
-        fully_shard(layer)
-    fully_shard(model)
+        fully_shard(layer, mp_policy=mp_policy)
+    fully_shard(model, mp_policy=mp_policy)
     return model
 
 
@@ -126,7 +133,7 @@ def main():
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--seq-len", type=int, default=512,
                         help="Sequence length for TP section")
-    parser.add_argument("--dtype", default="bf16",
+    parser.add_argument("--dtype", default=DTYPES[0],
                         choices=["bf16", "fp16", "fp32"])
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iters", type=int, default=50)

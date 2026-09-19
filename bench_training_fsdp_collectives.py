@@ -31,6 +31,10 @@ except (ImportError, ModuleNotFoundError):
 
 from bench_utils import BENCH_NCCL_TIMEOUT, bench, collect_metadata, reset_nccl_tuning, write_json
 
+# Dtypes run_all.sh sweeps (read from this line); the first is the default.
+# AG/RS per dtype; NVLS all-reduce runs for bf16/fp32 (no fp16 kernel).
+DTYPES = ("bf16", "fp16", "fp32")
+
 
 # Llama-70B parameter shapes (the training-relevant model)
 PARAMS = [
@@ -48,7 +52,7 @@ PARAMS = [
 def main():
     parser = argparse.ArgumentParser(
         description="FSDP2 training collectives benchmark")
-    parser.add_argument("--dtype", default="bf16",
+    parser.add_argument("--dtype", default=DTYPES[0],
                         choices=["bf16", "fp16", "fp32"])
     parser.add_argument("--warmup", type=int, default=50)
     parser.add_argument("--iters", type=int, default=200)

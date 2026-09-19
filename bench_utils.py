@@ -18,6 +18,11 @@ import torch.distributed as dist
 
 BENCH_NCCL_TIMEOUT = timedelta(seconds=120)
 
+def sizes_in_elems(sizes_bytes, dtype):
+    """Element counts for a byte-based size sweep, so every dtype moves the
+    same messages."""
+    return [n // dtype.itemsize for n in sizes_bytes]
+
 
 NVLINK_UNIDIR_GBPS = {
     "H200": 450,
@@ -225,22 +230,46 @@ def collect_metadata(benchmark_name, **kwargs):
     return meta
 
 
-def verify_close(name, a, b):
-    """Smoke-test that fused and unfused ops agree within BF16 noise.
+# Loose on purpose: catches a wrong shard or a missing reduce, not ULPs.
+# Absolute and scaled by max|out| because reduction outputs near zero carry
+# the rounding error of their partials. Sized for <= 8 ranks.
+VERIFY_ULPS = {torch.bfloat16: 8, torch.float16: 8, torch.float32: 256}
 
-    Tolerance is derived from the output dtype's precision at the tensor's
-    scale — no caller-supplied atol/rtol to get wrong. Empirically validated
-    at TP=2..4 on H200 (max observed: 2 ULPs); 4× ULP gives 2× margin.
+
+def verify_close(name, a, b, group=None):
+    """Smoke-test that fused and unfused outputs agree; raise on all ranks.
+
+    The verdict is all-reduced over `group` so ranks reaching this call
+    raise together; one rank raising alone would desync the collectives
+    that follow and hang the rest.
     """
-    a_f, b_f = a.float(), b.float()
-    max_mag = torch.max(a_f.abs().max(), b_f.abs().max()).item()
     eps = torch.finfo(a.dtype).eps
-    atol = max(eps, 4 * eps * max_mag)
-    if not torch.allclose(a_f, b_f, atol=atol, rtol=0):
-        max_diff = (a_f - b_f).abs().max().item()
-        raise RuntimeError(
-            f"Correctness check failed for {name}: "
-            f"max_diff={max_diff:.4f}, atol={atol:.4f}")
+    max_mag = max(a.abs().max().item(), b.abs().max().item())
+    atol = max(eps, VERIFY_ULPS[a.dtype] * eps * max_mag)
+    try:
+        torch.testing.assert_close(b, a, rtol=0, atol=atol)
+        err = None
+    except AssertionError as e:
+        err = f"Correctness check failed for {name}: {e}"
+
+    if dist.is_initialized():
+        flag = torch.tensor([float(err is not None)], device=a.device)
+        dist.all_reduce(flag, op=dist.ReduceOp.MAX, group=group)
+        if flag.item() > 0:
+            raise RuntimeError(err or f"{name}: failed on another rank")
+    elif err:
+        raise RuntimeError(err)
+
+
+def fsdp_mp_policy(dtype):
+    """FSDP2 policy: fp32 master weights, all-gather and reduce-scatter in
+    `dtype`. Pure-dtype params are not a valid fp16 configuration: Adam's
+    eps and (1-beta2)*g^2 underflow to 0, so the first step divides by 0.
+    """
+    from torch.distributed.fsdp import MixedPrecisionPolicy
+    if dtype == torch.float32:
+        return MixedPrecisionPolicy()
+    return MixedPrecisionPolicy(param_dtype=dtype, reduce_dtype=dtype)
 
 
 def write_json(path, data):

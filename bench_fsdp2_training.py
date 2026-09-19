@@ -23,7 +23,15 @@ import torch.nn as nn
 import torch.distributed as dist
 from torch.distributed.fsdp import fully_shard
 
-from bench_utils import BENCH_NCCL_TIMEOUT, bench, collect_metadata, reset_nccl_tuning, write_json
+from bench_utils import (
+    BENCH_NCCL_TIMEOUT, bench, collect_metadata, fsdp_mp_policy,
+    reset_nccl_tuning, write_json,
+)
+
+# Dtypes run_all.sh sweeps (read from this line); the first is the default.
+# FSDP2 step per dtype with fp32 master weights and dtype all-gather/reduce-
+# scatter.
+DTYPES = ("bf16", "fp16", "fp32")
 
 
 class MLPBlock(nn.Module):
@@ -55,12 +63,12 @@ class FSDPBenchModel(nn.Module):
 
 def build_and_shard(hidden, intermediate, num_layers, device, dtype):
     """Build model, move to device, apply fully_shard() bottom-up."""
-    model = FSDPBenchModel(hidden, intermediate, num_layers).to(
-        device=device, dtype=dtype)
+    model = FSDPBenchModel(hidden, intermediate, num_layers).to(device=device)
 
+    mp_policy = fsdp_mp_policy(dtype)
     for layer in model.layers:
-        fully_shard(layer)
-    fully_shard(model)
+        fully_shard(layer, mp_policy=mp_policy)
+    fully_shard(model, mp_policy=mp_policy)
 
     return model
 
@@ -76,7 +84,7 @@ def main():
                         help="Number of MLP layers to stack")
     parser.add_argument("--batch-sizes", type=int, nargs="+", default=[1, 4, 16],
                         help="Batch sizes to sweep")
-    parser.add_argument("--dtype", default="bf16",
+    parser.add_argument("--dtype", default=DTYPES[0],
                         choices=["bf16", "fp16", "fp32"])
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iters", type=int, default=50)
@@ -125,7 +133,9 @@ def main():
                                   device=device)
 
                 total_params = sum(p.numel() for p in model.parameters())
-                param_bytes = total_params * dtype.itemsize
+                # Sharded params are fp32 master weights regardless of dtype.
+                param_bytes = sum(p.numel() * p.element_size()
+                                  for p in model.parameters())
                 shard_bytes = param_bytes // world_size
 
                 def step():

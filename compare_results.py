@@ -27,7 +27,7 @@ def load_json(path):
 
 
 LABEL_KEYS = ("section", "topology", "collective", "op", "routing",
-              "model", "param_name")
+              "model", "param_name", "name")
 VALUE_KEYS = ("nelems", "seq_len", "num_tokens", "num_layers", "batch_size",
               "num_microbatches", "dtype", "hidden")
 
@@ -118,9 +118,22 @@ def compare_alpha_beta(baseline, test, threshold):
 
 
 def compare_file(baseline_path, test_path, threshold):
-    """Compare two JSON result files. Returns (comparisons, regressions, improvements)."""
+    """Compare two JSON result files.
+
+    Returns (comparisons, regressions, improvements, missing): every p50_us
+    metric (and pass/fail for correctness entries) present in both files,
+    and the labels of baseline entries absent from the test file.
+    """
     baseline = load_json(baseline_path)
     test = load_json(test_path)
+
+    # Result files are paired by name; a misnamed file would otherwise be
+    # compared across dtypes without warning.
+    for key in ("benchmark", "dtype"):
+        if baseline.get(key) != test.get(key):
+            raise ValueError(
+                f"{key} differs: baseline={baseline.get(key)!r} "
+                f"test={test.get(key)!r}")
 
     b_results = baseline.get("results", [])
     t_results = test.get("results", [])
@@ -128,6 +141,7 @@ def compare_file(baseline_path, test_path, threshold):
     comparisons = []
     regressions = 0
     improvements = 0
+    missing = []
 
     t_by_key = {}
     for t_entry in t_results:
@@ -135,9 +149,25 @@ def compare_file(baseline_path, test_path, threshold):
 
     for b_entry in b_results:
         t_entry = t_by_key.get(entry_key(b_entry))
-        if t_entry is None:
-            continue
         label = extract_label(b_entry)
+        if t_entry is None:
+            missing.append(label)
+            continue
+
+        # Correctness entries (bench_verify): pass -> fail is a regression.
+        if "passed" in b_entry and "passed" in t_entry:
+            b_ok, t_ok = bool(b_entry["passed"]), bool(t_entry["passed"])
+            flag = ""
+            if b_ok and not t_ok:
+                flag = "REGRESSION"
+                regressions += 1
+            elif t_ok and not b_ok:
+                flag = "IMPROVED"
+                improvements += 1
+            comparisons.append((label, "passed", float(b_ok), float(t_ok),
+                                0.0, flag))
+            continue
+
         b_metrics = dict(find_p50_metrics(b_entry))
         t_metrics = dict(find_p50_metrics(t_entry))
 
@@ -165,7 +195,7 @@ def compare_file(baseline_path, test_path, threshold):
     regressions += ab_regs
     improvements += ab_imps
 
-    return comparisons, regressions, improvements
+    return comparisons, regressions, improvements, missing
 
 
 def main():
@@ -198,6 +228,9 @@ def main():
     total_regressions = 0
     total_improvements = 0
     total_comparisons = 0
+    total_missing = 0
+    no_overlap = 0
+    errors = 0
 
     print(f"\n{'=' * 90}")
     print(f"Comparing: {args.baseline} (baseline) vs {args.test} (test)")
@@ -209,29 +242,41 @@ def main():
         t_path = os.path.join(args.test, filename)
 
         try:
-            comparisons, regs, imps = compare_file(b_path, t_path,
-                                                    args.threshold)
+            comparisons, regs, imps, missing = compare_file(
+                b_path, t_path, args.threshold)
         except Exception as e:
             print(f"\n=== {filename} === ERROR: {e}")
+            errors += 1
             continue
 
-        if not comparisons:
+        if not comparisons and not missing:
+            # Both files exist but no entry keys or metrics lined up: a
+            # schema change, not a clean pass.
+            print(f"\n=== {filename} === WARNING: no comparable metrics")
+            no_overlap += 1
             continue
 
         print(f"\n=== {filename} ===")
 
         for label, metric, b_val, t_val, pct, flag in comparisons:
-            sign = "+" if pct >= 0 else ""
             flag_str = f"  {flag}" if flag else ""
+            if metric == "passed":
+                b_s, t_s = ("pass" if b_val else "FAIL"), ("pass" if t_val else "FAIL")
+                print(f"  {label:<50s} {metric:<20s} {b_s:>8} -> {t_s:>8}{flag_str}")
+                continue
+            sign = "+" if pct >= 0 else ""
             print(
                 f"  {label:<50s} {metric:<20s}"
                 f" {b_val:>8.1f} -> {t_val:>8.1f}"
                 f"  ({sign}{pct:.1f}%){flag_str}"
             )
+        for label in missing:
+            print(f"  {label:<50s} MISSING in test")
 
         total_regressions += regs
         total_improvements += imps
         total_comparisons += len(comparisons)
+        total_missing += len(missing)
 
     unchanged = total_comparisons - total_regressions - total_improvements
 
@@ -243,13 +288,30 @@ def main():
         print(f"  {total_improvements} improvements (<-{args.threshold}% faster)")
     print(f"  {unchanged} unchanged (within +/-{args.threshold}%)")
 
+    # Anything the baseline has that the test run lacks means the test run
+    # did not complete; a gate must not pass on a partial comparison.
+    incomplete = []
     if only_baseline:
-        print(f"\n  Missing from test: {', '.join(only_baseline)}")
+        incomplete.append(f"{len(only_baseline)} baseline file(s) missing from "
+                          f"test: {', '.join(only_baseline)}")
+    if total_missing:
+        incomplete.append(f"{total_missing} baseline entr(y/ies) missing from test")
+    if no_overlap:
+        incomplete.append(f"{no_overlap} file pair(s) with no comparable metrics")
+    if errors:
+        incomplete.append(f"{errors} file pair(s) could not be compared")
+    if total_comparisons == 0:
+        incomplete.append("no metrics compared")
+    for line in incomplete:
+        print(f"  INCOMPLETE: {line}")
     if only_test:
-        print(f"  Missing from baseline: {', '.join(only_test)}")
+        print(f"  (new in test, not compared: {', '.join(only_test)})")
     print(f"{'=' * 90}\n")
 
-    sys.exit(1 if total_regressions > 0 else 0)
+    # 1: regression; 2: comparison incomplete or inconsistent; 0: clean.
+    if total_regressions > 0:
+        sys.exit(1)
+    sys.exit(2 if incomplete else 0)
 
 
 if __name__ == "__main__":

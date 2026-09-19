@@ -38,14 +38,18 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import fully_shard
 
 from bench_utils import (
-    BENCH_NCCL_TIMEOUT, bench, collect_metadata, get_gpu_peak_bandwidth,
-    reset_nccl_tuning, write_json,
+    BENCH_NCCL_TIMEOUT, bench, collect_metadata, fsdp_mp_policy,
+    get_gpu_peak_bandwidth, reset_nccl_tuning, sizes_in_elems, write_json,
 )
 
-SIZES = [
-    512, 2048, 8192, 32768, 131072, 524288,
-    2097152, 8388608, 33554432, 134217728, 536870912,
-]
+# Dtypes run_all.sh sweeps (read from this line); the first is the default. P2P
+# in bytes (SIZES); training sections use fp32 master weights with dtype
+# compute.
+DTYPES = ("bf16", "fp16", "fp32")
+
+
+# Message sizes in bytes, 1 KB .. 1 GB.
+SIZES = [1 << n for n in range(10, 31, 2)]
 
 
 def format_bytes(nbytes):
@@ -101,7 +105,7 @@ def bench_p2p_sweep(rank, world_size, device, dtype, warmup, iters):
     prev_rank = (rank - 1) % world_size
 
     results = []
-    for nelems in SIZES:
+    for nelems in sizes_in_elems(SIZES, dtype):
         send_buf = torch.randn(nelems, dtype=dtype, device=device)
         recv_buf = torch.empty(nelems, dtype=dtype, device=device)
 
@@ -138,7 +142,12 @@ def pipeline_step(stage_model, optimizer, inp_or_none, target_or_none,
             dist.recv(x, src=prev_rank)
 
         x = x.detach().requires_grad_(True)
-        out = stage_model(x)
+        # Master weights are fp32; compute in dtype so activations and the
+        # P2P buffers match. Under FSDP2 the mp_policy already casts params
+        # and autocast is a no-op.
+        with torch.autocast("cuda", dtype=dtype,
+                            enabled=dtype != torch.float32):
+            out = stage_model(x)
         saved.append((x, out))
 
         if next_rank is not None:
@@ -181,7 +190,7 @@ def bench_pipeline(rank, world_size, device, dtype,
         return None
 
     stage_model = StageModel(hidden, intermediate, layers_per_stage).to(
-        device=device, dtype=dtype)
+        device=device)
     optimizer = torch.optim.Adam(stage_model.parameters(), lr=1e-4)
 
     inp = None
@@ -252,11 +261,12 @@ def bench_fsdp2_pp(rank, world_size, device, dtype,
     next_rank = pp_col[pp_rank + 1] if pp_rank < pp_stages - 1 else None
 
     stage_model = StageModel(hidden, intermediate, layers_per_stage).to(
-        device=device, dtype=dtype)
+        device=device)
 
+    mp_policy = fsdp_mp_policy(dtype)
     for layer in stage_model.layers:
-        fully_shard(layer, mesh=dp_mesh)
-    fully_shard(stage_model, mesh=dp_mesh)
+        fully_shard(layer, mesh=dp_mesh, mp_policy=mp_policy)
+    fully_shard(stage_model, mesh=dp_mesh, mp_policy=mp_policy)
 
     optimizer = torch.optim.Adam(stage_model.parameters(), lr=1e-4)
 
@@ -299,7 +309,7 @@ def bench_fsdp2_pp(rank, world_size, device, dtype,
 # ---- Section 4: All-pairs P2P latency matrix ----
 
 
-ALL_PAIRS_SIZES = [8192, 33554432]
+ALL_PAIRS_SIZES = [16 << 10, 64 << 20]  # bytes
 
 
 def bench_all_pairs_p2p(rank, world_size, device, dtype, warmup, iters):
@@ -317,7 +327,7 @@ def bench_all_pairs_p2p(rank, world_size, device, dtype, warmup, iters):
 
     json_results = []
 
-    for nelems in ALL_PAIRS_SIZES:
+    for nelems in sizes_in_elems(ALL_PAIRS_SIZES, dtype):
         nbytes = nelems * dtype.itemsize
 
         my_times = torch.zeros(world_size, device=device)
@@ -401,7 +411,7 @@ def main():
                         help="MLP intermediate dim (default: 14336, Llama-8B)")
     parser.add_argument("--num-layers", type=int, nargs="+", default=[4, 8])
     parser.add_argument("--batch-sizes", type=int, nargs="+", default=[4, 16])
-    parser.add_argument("--dtype", default="bf16",
+    parser.add_argument("--dtype", default=DTYPES[0],
                         choices=["bf16", "fp16", "fp32"])
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iters", type=int, default=50)

@@ -22,7 +22,11 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
-from bench_utils import BENCH_NCCL_TIMEOUT, collect_metadata, write_json
+from bench_utils import BENCH_NCCL_TIMEOUT, collect_metadata, fsdp_mp_policy, write_json
+
+# Dtypes run_all.sh sweeps (read from this line); the first is the default.
+# Correctness gate: every dtype path is a distinct claim.
+DTYPES = ("fp32", "bf16", "fp16")
 
 
 class MLPBlock(nn.Module):
@@ -152,14 +156,14 @@ def verify_fsdp2_training(rank, world_size, device, dtype):
 
     hidden, intermediate, num_layers = 256, 512, 2
 
-    model = SimpleModel(hidden, intermediate, num_layers).to(
-        device=device, dtype=dtype)
+    model = SimpleModel(hidden, intermediate, num_layers).to(device=device)
 
     init_params = {n: p.clone() for n, p in model.named_parameters()}
 
+    mp_policy = fsdp_mp_policy(dtype)
     for layer in model.layers:
-        fully_shard(layer)
-    fully_shard(model)
+        fully_shard(layer, mp_policy=mp_policy)
+    fully_shard(model, mp_policy=mp_policy)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
     inp = torch.randn(4, hidden, dtype=dtype, device=device)
@@ -217,9 +221,16 @@ def verify_tp_inference(rank, world_size, device, dtype):
         hidden = world_size * (256 // world_size or 1)
     tokens = 4
 
+    # Entries in {-1, 0, 1} with hidden <= 256 keep every product and
+    # partial sum an integer of magnitude <= 256, exact in bf16 (8
+    # significand bits), fp16 and fp32. Every sharded path must then be
+    # bit-identical to the reference: no tolerance, for any world size.
+    def exact(*shape):
+        return torch.randint(-1, 2, shape, device=device).to(dtype)
+
     torch.manual_seed(0)
-    W_full = torch.randn(hidden, hidden, dtype=dtype, device=device)
-    x = torch.randn(tokens, hidden, dtype=dtype, device=device)
+    W_full = exact(hidden, hidden)
+    x = exact(tokens, hidden)
 
     dist.broadcast(W_full, src=0)
     dist.broadcast(x, src=0)
@@ -238,14 +249,14 @@ def verify_tp_inference(rank, world_size, device, dtype):
     gathered_reorder = gathered.view(world_size, tokens, shard_size)
     gathered_result = gathered_reorder.permute(1, 0, 2).contiguous().view(tokens, hidden)
 
-    ok = torch.allclose(gathered_result, ref, rtol=1e-2, atol=1e-2)
+    ok = torch.equal(gathered_result, ref)
     r, msg = check("TP column-parallel matmul", ok,
-                    f"max diff: {(gathered_result - ref).abs().max().item():.6f}")
+                    f"max diff: {(gathered_result - ref).abs().max().item():g}")
     results.append(r)
     if rank == 0:
         print(msg)
 
-    W_row_full = torch.randn(hidden, hidden, dtype=dtype, device=device)
+    W_row_full = exact(hidden, hidden)
     dist.broadcast(W_row_full, src=0)
 
     ref_row = torch.mm(x, W_row_full)
@@ -255,9 +266,9 @@ def verify_tp_inference(rank, world_size, device, dtype):
     partial_row = torch.mm(x_shard, W_row_shard)
     dist.all_reduce(partial_row)
 
-    ok = torch.allclose(partial_row, ref_row, rtol=1e-2, atol=1e-2)
+    ok = torch.equal(partial_row, ref_row)
     r, msg = check("TP row-parallel matmul + AllReduce", ok,
-                    f"max diff: {(partial_row - ref_row).abs().max().item():.6f}")
+                    f"max diff: {(partial_row - ref_row).abs().max().item():g}")
     results.append(r)
     if rank == 0:
         print(msg)
@@ -268,7 +279,7 @@ def verify_tp_inference(rank, world_size, device, dtype):
 def main():
     parser = argparse.ArgumentParser(
         description="Correctness verification gate for distributed operations")
-    parser.add_argument("--dtype", default="fp32",
+    parser.add_argument("--dtype", default=DTYPES[0],
                         choices=["bf16", "fp16", "fp32"])
     parser.add_argument("--json", metavar="PATH",
                         help="Write JSON results to PATH (rank 0 only)")

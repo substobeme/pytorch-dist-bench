@@ -72,7 +72,8 @@ spec:
                   --rdzv_backend=c10d
                   --rdzv_endpoint=$(MASTER_ADDR):$(MASTER_PORT)
                   bench_multinode.py
-                  --json /results/multinode_3n2g.json
+                  --json /results/multinode_3n2g_bf16.json
+                  --dtype bf16
               # securityContext:
               #   capabilities:
               #     add: ["IPC_LOCK"]
@@ -137,7 +138,8 @@ spec:
                   --rdzv_backend=c10d
                   --rdzv_endpoint=$(MASTER_ADDR):$(MASTER_PORT)
                   bench_multinode.py
-                  --json /results/multinode_3n2g.json
+                  --json /results/multinode_3n2g_bf16.json
+                  --dtype bf16
               # securityContext:
               #   capabilities:
               #     add: ["IPC_LOCK"]

@@ -33,6 +33,10 @@ except (ImportError, ModuleNotFoundError):
 
 from bench_utils import BENCH_NCCL_TIMEOUT, bench, collect_metadata, reset_nccl_tuning, verify_close, write_json
 
+# Dtypes run_all.sh sweeps (read from this line); the first is the default.
+# Fused GEMMs per dtype; NVLS all-reduce runs for bf16/fp32 (no fp16 kernel).
+DTYPES = ("bf16", "fp16", "fp32")
+
 
 MODELS = {
     "Llama-8B": {"hidden": 4096, "intermediate": 14336},
@@ -41,7 +45,6 @@ MODELS = {
 }
 
 SEQ_LENGTHS = [128, 512, 2048, 8192]
-
 
 
 def bench_reduce_scatter(group_name, rank, world_size, seq_len, hidden, tp,
@@ -113,15 +116,23 @@ def bench_all_gather(group_name, rank, world_size, seq_len, hidden, tp,
 
 def bench_all_reduce(group_name, rank, world_size, nelems,
                      dtype=torch.bfloat16, warmup=50, iters=200):
-    """Symmetric memory all-reduce (multimem/two-shot) vs dist.all_reduce."""
-    device = torch.device(f"cuda:{rank}")
-    buf = symm_mem.empty(nelems, dtype=dtype, device=device)
-    symm_mem.rendezvous(buf, group_name)
+    """Symmetric memory all-reduce (multimem/two-shot) vs dist.all_reduce.
 
+    The symm-mem kernels dispatch on bf16 and fp32 only; for other dtypes
+    the second result is None and only dist.all_reduce is measured.
+    """
+    device = torch.device(f"cuda:{rank}")
     regular = torch.randn(nelems, dtype=dtype, device=device)
 
     def dist_ar():
         dist.all_reduce(regular, group=dist.group.WORLD)
+
+    if dtype not in (torch.bfloat16, torch.float32):
+        reset_nccl_tuning(dist_ar)
+        return bench(dist_ar, warmup=warmup, iters=iters), None
+
+    buf = symm_mem.empty(nelems, dtype=dtype, device=device)
+    symm_mem.rendezvous(buf, group_name)
 
     def symm_ar():
         buf.copy_(regular)
@@ -141,7 +152,7 @@ def main():
                         choices=list(MODELS.keys()))
     parser.add_argument("--seq-lengths", nargs="+", type=int,
                         default=SEQ_LENGTHS)
-    parser.add_argument("--dtype", default="bf16",
+    parser.add_argument("--dtype", default=DTYPES[0],
                         choices=["bf16", "fp16", "fp32"])
     parser.add_argument("--warmup", type=int, default=50)
     parser.add_argument("--iters", type=int, default=200)
@@ -281,6 +292,8 @@ def main():
         print(hdr)
         print("-" * len(hdr))
 
+    if rank == 0 and dtype not in (torch.bfloat16, torch.float32):
+        print(f"  symm.ar: no {dtype} kernel; measuring dist.all_reduce only")
     ar_sizes = [1024, 4096, 16384, 65536, 262144, 1048576]
     for nelems in ar_sizes:
         try:
@@ -290,19 +303,20 @@ def main():
             )
             if rank == 0:
                 nbytes = nelems * dtype.itemsize
-                speedup = s_dist["p50_us"] / max(s_symm["p50_us"], 0.1)
-                print(
-                    f"{nelems:>10} {nbytes:>10}"
-                    f" | {s_dist['p50_us']:>8.1f}us {s_symm['p50_us']:>8.1f}us"
-                    f" {speedup:>7.2f}x"
-                )
+                if s_symm is None:
+                    symm_str, speedup = f"{'n/a':>10}", None
+                else:
+                    speedup = s_dist["p50_us"] / max(s_symm["p50_us"], 0.1)
+                    symm_str = f"{s_symm['p50_us']:>8.1f}us {speedup:>7.2f}x"
+                print(f"{nelems:>10} {nbytes:>10}"
+                      f" | {s_dist['p50_us']:>8.1f}us {symm_str}")
                 json_results.append({
                     "op": "all_reduce",
                     "nelems": nelems,
                     "nbytes": nbytes,
                     "dist": s_dist,
                     "symm_mem": s_symm,
-                    "speedup": round(speedup, 3),
+                    "speedup": None if speedup is None else round(speedup, 3),
                 })
         except Exception as e:
             if rank == 0:

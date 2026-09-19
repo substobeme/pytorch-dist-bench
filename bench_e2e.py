@@ -38,7 +38,14 @@ import torch.distributed as dist
 import torch.nn as nn
 from torch.distributed.fsdp import fully_shard
 
-from bench_utils import BENCH_NCCL_TIMEOUT, collect_metadata, stats, write_json
+from bench_utils import (
+    BENCH_NCCL_TIMEOUT, collect_metadata, fsdp_mp_policy, stats, write_json,
+)
+
+# Dtypes run_all.sh sweeps (read from this line); the first is the default.
+# Throughput per dtype; FSDP2 sections keep fp32 master weights
+# (fsdp_mp_policy).
+DTYPES = ("bf16", "fp16", "fp32")
 
 
 # ---- Models ----
@@ -73,12 +80,12 @@ class TransformerMLPModel(nn.Module):
 def bench_fsdp2_training(rank, world_size, device, dtype,
                          hidden, intermediate, num_layers,
                          batch_size, warmup, iters):
-    model = TransformerMLPModel(hidden, intermediate, num_layers).to(
-        device=device, dtype=dtype)
+    model = TransformerMLPModel(hidden, intermediate, num_layers).to(device=device)
 
+    mp_policy = fsdp_mp_policy(dtype)
     for layer in model.layers:
-        fully_shard(layer)
-    fully_shard(model)
+        fully_shard(layer, mp_policy=mp_policy)
+    fully_shard(model, mp_policy=mp_policy)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
     inp = torch.randn(batch_size, hidden, dtype=dtype, device=device)
@@ -274,11 +281,12 @@ def bench_fsdp2_pp_training(rank, world_size, device, dtype,
     next_rank = pp_col[pp_rank + 1] if pp_rank < pp_stages - 1 else None
 
     stage_model = TransformerMLPModel(hidden, intermediate, layers_per_stage).to(
-        device=device, dtype=dtype)
+        device=device)
 
+    mp_policy = fsdp_mp_policy(dtype)
     for layer in stage_model.layers:
-        fully_shard(layer, mesh=dp_mesh)
-    fully_shard(stage_model, mesh=dp_mesh)
+        fully_shard(layer, mesh=dp_mesh, mp_policy=mp_policy)
+    fully_shard(stage_model, mesh=dp_mesh, mp_policy=mp_policy)
 
     optimizer = torch.optim.Adam(stage_model.parameters(), lr=1e-4)
     total_params = sum(p.numel() for p in stage_model.parameters())
@@ -353,7 +361,7 @@ def main():
     parser.add_argument("--num-layers", type=int, default=4)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--num-microbatches", type=int, default=2)
-    parser.add_argument("--dtype", default="bf16",
+    parser.add_argument("--dtype", default=DTYPES[0],
                         choices=["bf16", "fp16", "fp32"])
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iters", type=int, default=50)

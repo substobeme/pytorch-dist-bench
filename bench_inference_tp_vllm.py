@@ -34,6 +34,11 @@ from bench_utils import (
     reset_nccl_tuning, write_json,
 )
 
+# Dtypes run_all.sh sweeps (read from this line); the first is the default.
+# AllReduce and GEMM cost per dtype at vLLM tensor shapes.
+DTYPES = ("bf16", "fp16", "fp32")
+
+
 MODELS = {
     "Llama-8B":   {"hidden": 4096,  "intermediate": 14336},
     "Llama-70B":  {"hidden": 8192,  "intermediate": 28672},
@@ -184,7 +189,7 @@ def main():
                         default=DECODE_BATCHES)
     parser.add_argument("--prefill-lengths", type=int, nargs="+",
                         default=PREFILL_LENGTHS)
-    parser.add_argument("--dtype", default="bf16",
+    parser.add_argument("--dtype", default=DTYPES[0],
                         choices=["bf16", "fp16", "fp32"])
     parser.add_argument("--warmup", type=int, default=50)
     parser.add_argument("--iters", type=int, default=200)

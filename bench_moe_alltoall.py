@@ -33,6 +33,10 @@ import torch.distributed as dist
 
 from bench_utils import BENCH_NCCL_TIMEOUT, bench, collect_metadata, reset_nccl_tuning, write_json
 
+# Dtypes run_all.sh sweeps (read from this line); the first is the default.
+# all_to_all_single moves bytes; the sweep records each dtype's message sizes.
+DTYPES = ("bf16", "fp16", "fp32")
+
 
 MODELS = {
     "Mixtral-8x7B": {
@@ -192,7 +196,7 @@ def main():
     parser.add_argument("--models", nargs="+", default=None,
                         help="Models to benchmark (default: all compatible)")
     parser.add_argument("--tokens", nargs="+", type=int, default=TOKEN_COUNTS)
-    parser.add_argument("--dtype", default="bf16",
+    parser.add_argument("--dtype", default=DTYPES[0],
                         choices=["bf16", "fp16", "fp32"])
     parser.add_argument("--warmup", type=int, default=50)
     parser.add_argument("--iters", type=int, default=200)

@@ -24,23 +24,17 @@ import torch.distributed as dist
 
 from bench_utils import (
     BENCH_NCCL_TIMEOUT, bench, collect_metadata, fit_alpha_beta,
-    get_gpu_peak_bandwidth, reset_nccl_tuning, write_json,
+    get_gpu_peak_bandwidth, reset_nccl_tuning, sizes_in_elems, write_json,
 )
 
+# Dtypes run_all.sh sweeps (read from this line); the first is the default. AG
+# moves bytes; AR/RS reduce in dtype. SIZES is in bytes so rows compare across
+# dtypes.
+DTYPES = ("bf16", "fp16", "fp32")
 
-SIZES = [
-    512,
-    2048,
-    8192,
-    32768,
-    131072,
-    524288,
-    2097152,
-    8388608,
-    33554432,
-    134217728,
-    536870912,
-]
+
+# Message sizes in bytes, 1 KB .. 1 GB.
+SIZES = [1 << n for n in range(10, 31, 2)]
 
 
 def algo_bw(nbytes, p50_us):
@@ -127,7 +121,7 @@ def format_bytes(nbytes):
 def main():
     parser = argparse.ArgumentParser(
         description="Raw collective operations benchmark (torch.distributed)")
-    parser.add_argument("--dtype", default="bf16",
+    parser.add_argument("--dtype", default=DTYPES[0],
                         choices=["bf16", "fp16", "fp32"])
     parser.add_argument("--warmup", type=int, default=50)
     parser.add_argument("--iters", type=int, default=200)
@@ -163,15 +157,16 @@ def main():
     all_results = []
     alpha_beta = {}
 
+    sizes = sizes_in_elems(SIZES, dtype)
     for collective_name, bench_fn in [
         ("all_reduce", bench_all_reduce),
         ("all_gather", bench_all_gather),
         ("reduce_scatter", bench_reduce_scatter),
     ]:
         if collective_name == "all_reduce":
-            results = bench_fn(device, dtype, SIZES, args.warmup, args.iters)
+            results = bench_fn(device, dtype, sizes, args.warmup, args.iters)
         else:
-            results = bench_fn(device, dtype, SIZES, world_size,
+            results = bench_fn(device, dtype, sizes, world_size,
                                args.warmup, args.iters)
 
         if rank == 0:

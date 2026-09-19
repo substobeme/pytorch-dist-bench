@@ -17,6 +17,35 @@ torchrun --nproc_per_node=8 bench_collectives.py --json results/collectives.json
 python compare_results.py results/baseline/ results/test/ --threshold 5
 ```
 
+### Data types
+
+Each benchmark declares the dtypes for which it measures something distinct
+in a `DTYPES = (...)` line at the top of its script, with the reason beside
+it; the first entry is the script's default. `run_all.sh` reads that line,
+runs one torchrun job per dtype and writes `<bench>_tp<N>_<dtype>.json`;
+`--dtypes "bf16"` restricts the sweep. Any dtype can still be forced on a
+single run with `--dtype`.
+
+| Sweep | Benchmarks | Why |
+|---|---|---|
+| bf16 fp16 fp32 | all dtype-aware benchmarks except `inference_tp_layer` (order is default-first; `verify` defaults to fp32) | each dtype has its own kernels (NCCL reduction, cuBLAS GEMM, Inductor codegen); training benchmarks keep fp32 master weights and run the collectives in the sweep dtype |
+| bf16 fp16 | `inference_tp_layer` | fused symm-mem GEMMs are 16-bit inference paths; fp32 at 405B/S=32K is ~10x slower per iteration and overruns the per-run timeout (`--dtype fp32` still works) |
+
+Byte-based size sweeps (`collectives`, `pipeline_parallel`, `multinode`) move
+the same messages in every dtype; element counts scale with `itemsize`.
+NVLS `multimem_all_reduce_` has no fp16 kernel, so those rows record the
+NCCL number with the symm-mem field null.
+
+Training benchmarks hold fp32 master weights and optimizer state, with
+`MixedPrecisionPolicy(param_dtype=dtype, reduce_dtype=dtype)` under FSDP2
+and `autocast` for the non-FSDP GPipe stage (which re-casts the fp32
+weights to `dtype` on every microbatch, a cost real GPipe users also pay);
+pure fp16 parameters with Adam diverge on the first step. `reduce_dtype=dtype` is deliberate so the
+gradient reduce-scatter runs in the sweep dtype (torchtitan's default
+reduces in fp32 and moves 2x the bytes). Under fp16, FSDP2 reduces with SUM
+plus pre/post-scaling kernels rather than a single AVG, so fp16-vs-bf16
+step-time deltas are not purely the NCCL dtype.
+
 ## Requirements
 
 - PyTorch 2.6+ (for `fully_shard`, symmetric memory, FP8 fused ops)
@@ -32,7 +61,7 @@ Some benchmarks require NVSwitch and symmetric memory support (see table below).
 |---|---|---|
 | `bench_verify` | Correctness gate: validates AllReduce, AllGather, ReduceScatter, P2P Send/Recv, FSDP2 training (loss finite + decreasing + params updated), and TP inference (sharded matmul matches reference). Run first — if correctness fails, performance numbers are meaningless. | No |
 | `bench_collectives` | AllReduce, AllGather, ReduceScatter at 11 message sizes (1KB–1GB) through `torch.distributed`. The nccl-tests equivalent through the ProcessGroup stack. Reports efficiency % vs NVLink peak. | No |
-| `bench_symm_mem_fused_ops` | BF16 fused GEMM+ReduceScatter, AllGather+GEMM, NVLS AllReduce via `torch.distributed._symmetric_memory`. The TP inference fast path. | Yes |
+| `bench_symm_mem_fused_ops` | Fused GEMM+ReduceScatter, AllGather+GEMM, NVLS AllReduce via `torch.distributed._symmetric_memory`. The TP inference fast path. | Yes |
 | `bench_fp8_fused_ops` | FP8 scaled fused ops (`_fused_all_gather_scaled_matmul`, `_fused_scaled_matmul_reduce_scatter`) vs unfused equivalents. The quantized inference path. | Yes |
 | `bench_migration_path` | pynccl → `torch.distributed` → fused ops progression. Validates that migrating dispatch paths doesn't regress and that fused ops improve latency. | Yes |
 | `bench_inference_tp_layer` | Full TP transformer layer (attention + MLP) with fused vs unfused collectives. Composite benchmark at real Llama-70B dimensions. | Yes |
@@ -69,7 +98,7 @@ Or directly:
 ```bash
 torchrun --nnodes=3 --nproc_per_node=2 \
   --rdzv_backend=c10d --rdzv_endpoint=<master-ip>:29500 \
-  bench_multinode.py --json results/multinode_3n2g.json
+  bench_multinode.py --json results/multinode_3n2g_bf16.json --dtype bf16
 ```
 
 Run only one section:
@@ -167,14 +196,16 @@ The `p50_us` field (median latency in microseconds) is the primary metric used f
 
 ## Comparing results
 
-`compare_results.py` matches JSON files by filename between two result directories, extracts `p50_us` metrics, and flags regressions:
+`compare_results.py` matches JSON files by filename between two result directories, extracts `p50_us` metrics, and flags regressions. Files are named `<bench>_tp<N>_<dtype>.json` (or `<bench>_tp<N>.json` for benchmarks without a dtype option), and paired files must agree on `benchmark` and `dtype`; a pair with no comparable metrics is reported and the exit code is 2.
+
+Baselines produced before the dtype suffix: for `verify`, `collectives`, `symm_mem_fused_ops`, `inference_tp_layer`, `inference_tp_vllm`, `moe_alltoall` and `training_fsdp_collectives`, rename `<bench>_tp<N>.json` to `<bench>_tp<N>_<dtype>.json` using the file's own top-level `dtype` field (bf16 for all of these except `verify`, which defaulted to fp32); `compare_results.py` refuses a pair whose `dtype` fields differ, so a wrong guess is caught. The training benchmarks (`fsdp2_training`, `e2e`, `compile_distributed`, `pipeline_parallel`, `multinode`) changed configuration — fp32 master weights instead of parameters in the run dtype — so step times and `peak_MB` moved and their baselines must be regenerated, not renamed (`pipeline_parallel` is one file, so its P2P rows go with it).
 
 ```bash
 python compare_results.py results/baseline/ results/test/
 ```
 
 ```
-=== bench_collectives_tp8.json ===
+=== bench_collectives_tp8_bf16.json ===
   all_reduce  nelems=536870912      stats    1234.5 ->  1298.7  (+5.2%)  REGRESSION
   all_gather  nelems=536870912      stats    1100.2 ->  1045.1  (-5.0%)  IMPROVED
   ...
@@ -185,7 +216,7 @@ Summary: 42 metrics compared
   40 unchanged (within +/-5.0%)
 ```
 
-Exit code is non-zero when any regression exceeds the threshold (default: 5%).
+Exit code: 1 when any regression exceeds the threshold (default: 5%); 2 when the comparison is incomplete or inconsistent (a baseline file or entry missing from the test run, paired files disagreeing on `benchmark`/`dtype`, or no comparable metrics); 0 otherwise. A regression takes precedence over an incomplete run.
 
 ## A/B testing a PyTorch PR
 
@@ -214,7 +245,7 @@ All benchmarks share infrastructure through `bench_utils.py`:
 bench_utils.py                  # Shared timing, stats, metadata, JSON output
 bench_verify.py                 # Correctness gate (collectives, P2P, FSDP2, TP)
 bench_collectives.py            # Raw collective sweep (AR/AG/RS × 11 sizes)
-bench_symm_mem_fused_ops.py     # BF16 fused ops (symmetric memory)
+bench_symm_mem_fused_ops.py     # Fused ops (symmetric memory)
 bench_fp8_fused_ops.py          # FP8 scaled fused ops
 bench_migration_path.py         # pynccl → dist → fused migration
 bench_inference_tp_layer.py     # Full TP layer (attention + MLP)

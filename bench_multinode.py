@@ -48,26 +48,20 @@ from torch.distributed.tensor.parallel import (
 )
 
 from bench_utils import (
-    BENCH_NCCL_TIMEOUT, bench, collect_metadata, get_gpu_peak_bandwidth,
-    reset_nccl_tuning, write_json,
+    BENCH_NCCL_TIMEOUT, bench, collect_metadata, fsdp_mp_policy,
+    get_gpu_peak_bandwidth, reset_nccl_tuning, sizes_in_elems, write_json,
 )
+
+# Dtypes run_all.sh sweeps (read from this line); the first is the default.
+# Opt-in multi-node; collectives in bytes (SIZES), 2D training with fp32 master
+# weights.
+DTYPES = ("bf16", "fp16", "fp32")
 
 
 # ---- Collective helpers (same as bench_collectives.py) ----
 
-SIZES = [
-    512,
-    2048,
-    8192,
-    32768,
-    131072,
-    524288,
-    2097152,
-    8388608,
-    33554432,
-    134217728,
-    536870912,
-]
+# Message sizes in bytes, 1 KB .. 1 GB.
+SIZES = [1 << n for n in range(10, 31, 2)]
 
 
 def algo_bw(nbytes, p50_us):
@@ -224,7 +218,7 @@ def run_collectives_section(args, rank, world_size, local_rank,
                 print("-" * len(hdr))
 
             results = bench_collective(
-                coll_name, group, device, dtype, SIZES,
+                coll_name, group, device, dtype, sizes_in_elems(SIZES, dtype),
                 group_size, args.warmup, args.iters,
             )
 
@@ -296,9 +290,7 @@ class FSDPBenchModel(nn.Module):
 def build_2d_model(hidden, intermediate, num_layers, tp_mesh, dp_mesh,
                    device, dtype):
     """Build model with TP (intra-node) + FSDP2 (inter-node DP)."""
-    model = FSDPBenchModel(hidden, intermediate, num_layers).to(
-        device=device, dtype=dtype,
-    )
+    model = FSDPBenchModel(hidden, intermediate, num_layers).to(device=device)
 
     for layer in model.layers:
         parallelize_module(layer, tp_mesh, {
@@ -306,9 +298,10 @@ def build_2d_model(hidden, intermediate, num_layers, tp_mesh, dp_mesh,
             "down": RowwiseParallel(),
         })
 
+    mp_policy = fsdp_mp_policy(dtype)
     for layer in model.layers:
-        fully_shard(layer, mesh=dp_mesh)
-    fully_shard(model, mesh=dp_mesh)
+        fully_shard(layer, mesh=dp_mesh, mp_policy=mp_policy)
+    fully_shard(model, mesh=dp_mesh, mp_policy=mp_policy)
 
     return model
 
@@ -430,7 +423,7 @@ def main():
                         help="Layer counts to sweep (training section)")
     parser.add_argument("--batch-sizes", type=int, nargs="+", default=[1, 4],
                         help="Batch sizes to sweep (training section)")
-    parser.add_argument("--dtype", default="bf16",
+    parser.add_argument("--dtype", default=DTYPES[0],
                         choices=["bf16", "fp16", "fp32"])
     parser.add_argument("--warmup", type=int, default=50)
     parser.add_argument("--iters", type=int, default=200)

@@ -38,6 +38,11 @@ except (ImportError, ModuleNotFoundError):
 
 from bench_utils import BENCH_NCCL_TIMEOUT, bench, collect_metadata, reset_nccl_tuning, verify_close, write_json
 
+# Dtypes run_all.sh sweeps (read from this line); the first is the default.
+# Fused symm-mem GEMMs serve 16-bit inference; fp32 at 405B/S=32K is ~10x
+# slower per iter and overruns run_all's timeout. Force with --dtype fp32.
+DTYPES = ("bf16", "fp16")
+
 
 MODELS = {
     "Llama-8B":   {"hidden": 4096, "intermediate": 14336, "num_layers": 32,
@@ -136,7 +141,7 @@ def main():
                         choices=list(MODELS.keys()))
     parser.add_argument("--seq-lengths", nargs="+", type=int,
                         default=SEQ_LENGTHS)
-    parser.add_argument("--dtype", default="bf16",
+    parser.add_argument("--dtype", default=DTYPES[0],
                         choices=["bf16", "fp16", "fp32"])
     parser.add_argument("--warmup", type=int, default=50)
     parser.add_argument("--iters", type=int, default=200)

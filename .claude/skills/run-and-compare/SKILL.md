@@ -14,9 +14,10 @@ How to run the benchmark suite, produce valid comparisons, and avoid statistical
 ```bash
 ./run_all.sh 8                              # 8 GPUs, JSON to ./results/
 ./run_all.sh 8 --json-dir /path/to/output   # custom output directory
+./run_all.sh 8 --dtypes "bf16"              # subset of each benchmark's sweep
 ```
 
-Runs all 14 benchmarks sequentially (prevents GPU contention), starting with `bench_verify` (correctness gate). Each benchmark writes `bench_NAME_tpN.json`.
+Runs all 14 benchmarks sequentially (prevents GPU contention), starting with `bench_verify` (correctness gate). Each benchmark runs once per dtype in the `DTYPES = (...)` line at the top of its script (the README "Data types" table says why) and writes `bench_NAME_tpN_<dtype>.json`; the three benchmarks without a `--dtype` option (`allreduce_dispatch`, `fp8_fused_ops`, `migration_path`) write `bench_NAME_tpN.json`.
 
 ### Individual benchmarks
 
@@ -26,18 +27,19 @@ torchrun --nproc_per_node=8 bench_inference_tp_vllm.py --section allreduce --jso
 torchrun --nproc_per_node=4 bench_pipeline_parallel.py --section fsdp2_pp --pp-stages 2 --json results/pp.json
 ```
 
-All benchmarks accept `--json PATH` (rank 0 writes), `--dtype bf16|fp16|fp32`, `--warmup N`, `--iters N`. Most accept `--section` to run a subset.
+All benchmarks accept `--json PATH` (rank 0 writes); all but `bench_verify` accept `--warmup N` and `--iters N`. All but `allreduce_dispatch`, `fp8_fused_ops` and `migration_path` accept `--dtype bf16|fp16|fp32` (any dtype can be forced, even one outside the benchmark's declared sweep). `e2e`, `inference_tp_vllm`, `multinode` and `pipeline_parallel` accept `--section` to run a subset.
 
 ### Multi-node
 
 ```bash
 # Via helper script (each node)
 ./run_multinode.sh <nnodes> <nproc_per_node> <master-ip> <port>
+DTYPE=fp16 ./run_multinode.sh <nnodes> <nproc_per_node> <master-ip> <port>   # one dtype per run
 
 # Via torchrun directly
 torchrun --nnodes=3 --nproc_per_node=8 \
   --rdzv_backend=c10d --rdzv_endpoint=master:29500 \
-  bench_multinode.py --json results/multinode.json
+  bench_multinode.py --json results/multinode_3n8g_bf16.json --dtype bf16
 
 # Via Kubernetes
 kubectl apply -f k8s/pytorchjob.yaml
@@ -50,7 +52,7 @@ python compare_results.py results/baseline/ results/test/
 python compare_results.py results/baseline/ results/test/ --threshold 10
 ```
 
-The tool matches JSON files by filename between directories, extracts all `p50_us` values, and reports % change. Exit code is non-zero if any regression exceeds the threshold.
+The tool matches JSON files by filename between directories, extracts all `p50_us` values (and pass/fail for `bench_verify`), and reports % change. Exit code 1 if any regression exceeds the threshold; 2 if the comparison is incomplete (baseline files or entries missing from the test run, `benchmark`/`dtype` mismatch between paired files, no comparable metrics); 0 otherwise.
 
 **Reading the output**:
 - Each row shows: label, metric path, baseline p50_us → test p50_us, (% change), flag
@@ -58,7 +60,7 @@ The tool matches JSON files by filename between directories, extracts all `p50_u
 - `IMPROVED` = faster by more than threshold
 - No flag = within threshold (unchanged)
 
-Labels are built from JSON fields: section, topology, collective, model, plus numeric keys (nelems, batch_size, num_layers, num_microbatches).
+Labels and match keys come from `LABEL_KEYS` and `VALUE_KEYS` in `compare_results.py` (section, topology, collective, op, routing, model, param_name, name; nelems, seq_len, num_tokens, num_layers, batch_size, num_microbatches, dtype, hidden).
 
 ## A/B Testing a PyTorch PR
 

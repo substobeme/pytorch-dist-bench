@@ -17,6 +17,10 @@ Conventions and patterns for writing new benchmarks in this suite. Every benchma
 
 ```python
 from bench_utils import bench, collect_metadata, reset_nccl_tuning, write_json
+
+# Dtypes run_all.sh sweeps (read from this line); the first is the default.
+# One line on why these dtypes measure something distinct.
+DTYPES = ("bf16", "fp16", "fp32")
 ```
 
 **`bench(fn, *, warmup=50, iters=200)`** — CUDA-synchronous timing. Returns stats dict with `p50_us`, `mean_us`, `p5_us`, `p95_us`, `min_us`, `max_us`, `iqr_us`, `iters`. Flags high variance (IQR/median > 10%). This is the only timing function — never roll your own `time.time()` loop.
@@ -33,7 +37,7 @@ Every benchmark should accept:
 
 ```python
 parser.add_argument("--section", default="all", choices=["all", "foo", "bar"])
-parser.add_argument("--dtype", default="bf16", choices=["bf16", "fp16", "fp32"])
+parser.add_argument("--dtype", default=DTYPES[0], choices=["bf16", "fp16", "fp32"])
 parser.add_argument("--warmup", type=int, default=50)
 parser.add_argument("--iters", type=int, default=200)
 parser.add_argument("--json", metavar="PATH", help="Write JSON results to PATH (rank 0 only)")
@@ -100,16 +104,17 @@ Bus bandwidth correction factors differ by collective: AllReduce uses `2*(n-1)/n
 
 ## Message Size Sweep
 
-The standard sweep covers 11 sizes from 512 to 536M elements:
+The standard sweep covers 11 message sizes from 1 KB to 1 GB, defined in
+bytes so every dtype moves the same messages:
 
 ```python
-SIZES = [
-    512, 2048, 8192, 32768, 131072, 524288,
-    2097152, 8388608, 33554432, 134217728, 536870912,
-]
+SIZES = [1 << n for n in range(10, 31, 2)]      # bytes
+...
+for nelems in sizes_in_elems(SIZES, dtype):      # bench_utils
 ```
 
-Use this array for consistency with existing benchmarks and `compare_results.py` label matching.
+Use this so `compare_results.py` labels (`nelems`) line up with the existing
+benchmarks; for bf16 the element counts are 512 .. 536870912.
 
 ## OOM Resilience Pattern
 
@@ -168,9 +173,9 @@ Default dimensions: Llama-8B (hidden=4096, intermediate=14336), Llama-70B (hidde
 
 After writing the benchmark:
 
-1. **`run_all.sh`** — add to the `BENCHMARKS` array in logical order
-2. **`compare_results.py`** — if your JSON results include new numeric keys used for label differentiation (e.g., `num_microbatches`), add them to `extract_label()`'s numeric keys list
-3. **`README.md`** — update the benchmark count, add a row to the benchmarks table (include NVSwitch requirement), update the portable subset count if applicable, add to the project structure listing
+1. **`run_all.sh`** — add to the `BENCHMARKS` array in logical order; the dtypes it sweeps come from the script's `DTYPES` line (it aborts if a script takes `--dtype` but declares none)
+2. **`compare_results.py`** — if your JSON entries need a new field to tell them apart (e.g. `num_microbatches`), add it to `VALUE_KEYS` (or `LABEL_KEYS` for string fields); both entry matching and labels use those tuples
+3. **`README.md`** — update the benchmark count, add a row to the benchmarks table (include NVSwitch requirement), update the portable subset count if applicable, add to the project structure listing, and add the benchmark to the dtype sweep table
 4. **Syntax check** — `python -m py_compile bench_new.py`
 5. **Smoke test** — `torchrun --nproc_per_node=2 bench_new.py --iters 3 --warmup 2`
 6. **Full run** — `./run_all.sh 2` to verify the new benchmark integrates without breaking others
